@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+set -euo pipefail
+###############################################################################
+# spotlight-dev-ignore
+# Created by: Electric BlueFish Productions Inc. (https://electricbluefish.com)
+# Created on: 2026-29-06
+#
+# Purpose
+# -------
+# Optimize Spotlight performance on macOS development workstations by
+# automatically marking large dependency, cache, build, and generated
+# directories with a `.metadata_never_index` file.
+#
+# Modern development environments (Node.js, Laravel, WordPress, Joomla,
+# Python, etc.) can contain hundreds of thousands of files that provide
+# little or no value to Spotlight search while dramatically increasing
+# indexing time and disk activity.
+#
+# Rather than disabling Spotlight completely, this utility selectively
+# excludes only directories that are safe to ignore, allowing source code,
+# documents, and project files to remain searchable.
+#
+# Supported Development Environments
+# ----------------------------------
+# • JavaScript / Node.js
+# • PHP / Composer
+# • Laravel
+# • WordPress
+# • Joomla
+# • Python
+#
+# Automatically Detects and Marks
+# -------------------------------
+# General
+#   node_modules/
+#   vendor/
+#   .venv/
+#   venv/
+#   env/
+#   __pycache__/
+#   .tox/
+#   .nox/
+#   .pytest_cache/
+#   .mypy_cache/
+#   .ruff_cache/
+#   .coverage/
+#   htmlcov/
+#   coverage/
+#   dist/
+#   build/
+#   .next/
+#   .nuxt/
+#   .parcel-cache/
+#   .turbo/
+#   .cache/
+#   .vite/
+#   .rollup.cache/
+#   .eslintcache/
+#   .stylelintcache/
+#   .sass-cache/
+#   bower_components/
+#   .gradle/
+#
+# Laravel
+#   bootstrap/cache/
+#   storage/framework/cache/
+#   storage/framework/views/
+#   storage/framework/sessions/
+#   storage/framework/testing/
+#   storage/logs/
+#
+# Features
+# --------
+# ✓ Dry-run mode to preview changes
+# ✓ Apply mode to create .metadata_never_index markers
+# ✓ Undo mode to remove only markers created by this utility
+# ✓ Status reporting
+# ✓ Persistent state database
+# ✓ Timestamped audit log
+# ✓ Automatically adopts existing markers
+# ✓ Removes stale entries from the state database
+# ✓ Supports multiple scan roots
+# ✓ Optional Spotlight daemon restart
+#
+# Files Created
+# -------------
+# ~/.config/spotlight-dev-ignore/
+#     applied.txt
+#         Persistent list of directories managed by this utility.
+#
+#     optimize-spotlight-dev.log
+#         Timestamped audit log of all operations.
+#
+# Why Not Disable Spotlight?
+# --------------------------
+# Completely disabling Spotlight removes useful functionality such as:
+#
+#   • Finder search
+#   • File search from Spotlight
+#   • Quick Look metadata
+#   • Many developer tools that rely on Spotlight metadata
+#
+# This utility instead excludes only directories that are expensive to
+# index and rarely useful to search.
+#
+# Typical Usage
+# -------------
+# Default mode is --dry-run unless --apply, --undo, --status, or --clean-log is provided.
+#
+# Preview changes:
+#
+#     spotlight-dev-ignore --dry-run ~/Documents
+#
+# Apply markers:
+#
+#     spotlight-dev-ignore --apply ~/Documents ~/Sites ~/Work
+#
+# View status:
+#
+#     spotlight-dev-ignore --status
+#
+# Remove markers created by this utility:
+#
+#     spotlight-dev-ignore --undo
+#
+# Clear the audit log:
+#
+#     spotlight-dev-ignore --clean-log
+#
+# Notes
+# -----
+# • Source code is NEVER excluded.
+# • Only dependency, cache, build, and generated directories are marked.
+# • Existing .metadata_never_index files are adopted into the state database.
+# • The utility is safe to run repeatedly (idempotent).
+#
+###############################################################################
+
+
+CONFIG_DIR="${HOME}/.config/spotlight-dev-ignore"
+STATE_FILE="${CONFIG_DIR}/applied.txt"
+LOG_FILE="${CONFIG_DIR}/optimize-spotlight-dev.log"
+DEFAULT_SCAN_ROOTS=("${HOME}/Documents")
+
+# Directories that are safe/useful to exclude from Spotlight indexing.
+# This intentionally avoids source directories like app/, src/, wp-content/, plugins/, themes/, etc.
+IGNORE_DIR_NAMES=(
+  "node_modules"
+  "vendor"
+  ".venv"
+  "venv"
+  "env"
+  ".tox"
+  ".nox"
+  "__pycache__"
+  ".pytest_cache"
+  ".mypy_cache"
+  ".ruff_cache"
+  ".coverage"
+  "htmlcov"
+  ".next"
+  ".nuxt"
+  ".parcel-cache"
+  ".turbo"
+  ".cache"
+  "coverage"
+  "dist"
+  "build"
+  ".vite"
+  ".rollup.cache"
+  ".eslintcache"
+  ".stylelintcache"
+  ".sass-cache"
+  "bower_components"
+  ".gradle"
+)
+
+# Laravel-specific generated/cache dirs.
+LARAVEL_RELATIVE_DIRS=(
+  "storage/framework/cache"
+  "storage/framework/sessions"
+  "storage/framework/testing"
+  "storage/framework/views"
+  "storage/logs"
+  "bootstrap/cache"
+)
+
+MODE="dry-run"
+VERBOSE=0
+CLEAN_STATE=1
+RESTART_MDS=0
+SCAN_ROOTS=()
+
+usage() {
+  cat <<'EOF'
+Usage:
+  spotlight-dev-ignore [options] [scan roots...]
+
+Modes:
+  --dry-run          Show what would be marked. Default.
+  --apply            Create .metadata_never_index markers.
+  --undo             Remove only markers recorded in this tool's state file.
+  --status           Show summary and state file details.
+  --clean-log        Truncate the log file.
+
+Options:
+  --scan PATH        Add a scan root. Can be repeated.
+  --verbose          Print detailed actions.
+  --no-clean-state   Do not remove missing paths from the state file.
+  --restart-mds      After --apply or --undo, restart Spotlight daemons.
+  --help             Show this help.
+
+Examples:
+  spotlight-dev-ignore --dry-run ~/Documents
+  spotlight-dev-ignore --apply ~/Documents ~/Projects
+  spotlight-dev-ignore --status
+  spotlight-dev-ignore --undo
+  spotlight-dev-ignore --clean-log
+
+Files:
+  ~/.config/spotlight-dev-ignore/applied.txt
+  ~/.config/spotlight-dev-ignore/optimize-spotlight-dev.log
+EOF
+}
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+log_msg() {
+  local level="$1"
+  shift
+  mkdir -p "$CONFIG_DIR"
+  printf '%s [%s] %s\n' "$(timestamp)" "$level" "$*" >> "$LOG_FILE"
+}
+
+say() {
+  printf '%s\n' "$*"
+}
+
+verbose() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    say "$*"
+  fi
+}
+
+init_files() {
+  mkdir -p "$CONFIG_DIR"
+  touch "$STATE_FILE" "$LOG_FILE"
+}
+
+canonical_path() {
+  # Avoid realpath dependency differences on older macOS.
+  local p="$1"
+  if [[ -d "$p" ]]; then
+    (cd "$p" 2>/dev/null && pwd -P) || return 1
+  else
+    return 1
+  fi
+}
+
+state_contains() {
+  local path="$1"
+  grep -Fxq "$path" "$STATE_FILE" 2>/dev/null
+}
+
+add_state() {
+  local path="$1"
+  if ! state_contains "$path"; then
+    printf '%s\n' "$path" >> "$STATE_FILE"
+  fi
+}
+
+clean_state_missing() {
+  [[ "$CLEAN_STATE" -eq 1 ]] || return 0
+  [[ -f "$STATE_FILE" ]] || return 0
+
+  local tmp missing=0 kept=0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-ignore-state.XXXXXX")"
+
+  while IFS= read -r path || [[ -n "$path" ]]; do
+    [[ -z "$path" ]] && continue
+    if [[ -d "$path" ]]; then
+      printf '%s\n' "$path" >> "$tmp"
+      kept=$((kept + 1))
+    else
+      log_msg "MISSING" "$path"
+      missing=$((missing + 1))
+    fi
+  done < "$STATE_FILE"
+
+  mv "$tmp" "$STATE_FILE"
+  log_msg "STATE" "cleaned state: kept=${kept}, missing=${missing}"
+}
+
+restart_mds_if_requested() {
+  [[ "$RESTART_MDS" -eq 1 ]] || return 0
+  log_msg "MDS" "Restarting Spotlight daemons by request"
+  say "Restarting Spotlight daemons..."
+  sudo killall mds mds_stores mdworker_shared 2>/dev/null || true
+}
+
+find_ignore_dirs() {
+  local root="$1"
+
+  # Build a portable find expression:
+  #   prune known noisy parent dirs that should not be scanned
+  #   match directory names from IGNORE_DIR_NAMES
+  local name_expr=()
+  local first=1
+
+  for name in "${IGNORE_DIR_NAMES[@]}"; do
+    if [[ "$first" -eq 1 ]]; then
+      name_expr+=( -name "$name" )
+      first=0
+    else
+      name_expr+=( -o -name "$name" )
+    fi
+  done
+
+  find "$root" \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$HOME/Applications" \) -prune -o \
+    -type d \( "${name_expr[@]}" \) -print -prune 2>/dev/null
+}
+
+find_laravel_dirs() {
+  local root="$1"
+  local artisan candidate rel
+
+  find "$root" \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$HOME/Applications" -o -name node_modules -o -name vendor \) -prune -o \
+    -type f -name artisan -print 2>/dev/null |
+  while IFS= read -r artisan; do
+    local project_dir
+    project_dir="$(dirname "$artisan")"
+    for rel in "${LARAVEL_RELATIVE_DIRS[@]}"; do
+      candidate="${project_dir}/${rel}"
+      [[ -d "$candidate" ]] && printf '%s\n' "$candidate"
+    done
+  done
+}
+
+discover_targets() {
+  local root canonical
+  for root in "${SCAN_ROOTS[@]}"; do
+    canonical="$(canonical_path "$root" || true)"
+    if [[ -z "${canonical:-}" ]]; then
+      log_msg "WARN" "scan root not found or unreadable: $root"
+      say "Skipping missing/unreadable root: $root" >&2
+      continue
+    fi
+
+    log_msg "SCAN" "$canonical"
+    find_ignore_dirs "$canonical"
+    find_laravel_dirs "$canonical"
+  done | awk '!seen[$0]++'
+}
+
+mark_dir() {
+  local dir="$1"
+  local marker="${dir}/.metadata_never_index"
+
+  if [[ -e "$marker" ]]; then
+    if state_contains "$dir"; then
+      log_msg "SKIP" "Already marked and recorded: $dir"
+      verbose "SKIP already marked: $dir"
+    else
+      log_msg "ADOPTED" "Marker already existed; adding to state: $dir"
+      add_state "$dir"
+      verbose "ADOPTED existing marker: $dir"
+    fi
+    return 0
+  fi
+
+  if [[ "$MODE" == "dry-run" ]]; then
+    log_msg "WOULD_MARK" "$dir"
+    say "WOULD MARK: $dir"
+    return 0
+  fi
+
+  touch "$marker"
+  add_state "$dir"
+  log_msg "MARKED" "$dir"
+  verbose "MARKED: $dir"
+}
+
+apply_or_dry_run() {
+  init_files
+  clean_state_missing
+
+  local total=0 marked=0 already=0 would=0 adopted=0 dir marker
+
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    total=$((total + 1))
+    marker="${dir}/.metadata_never_index"
+
+    if [[ -e "$marker" ]]; then
+      if state_contains "$dir"; then
+        already=$((already + 1))
+      else
+        adopted=$((adopted + 1))
+      fi
+    else
+      if [[ "$MODE" == "dry-run" ]]; then
+        would=$((would + 1))
+      else
+        marked=$((marked + 1))
+      fi
+    fi
+
+    mark_dir "$dir"
+  done < <(discover_targets)
+
+  if [[ "$MODE" == "dry-run" ]]; then
+    say "Summary: scanned targets=${total}, would_mark=${would}, already_marked=${already}, adopted_existing=${adopted}"
+    log_msg "SUMMARY" "mode=dry-run targets=${total} would_mark=${would} already_marked=${already} adopted_existing=${adopted}"
+  else
+    say "Summary: scanned targets=${total}, marked=${marked}, already_marked=${already}, adopted_existing=${adopted}"
+    log_msg "SUMMARY" "mode=apply targets=${total} marked=${marked} already_marked=${already} adopted_existing=${adopted}"
+    restart_mds_if_requested
+  fi
+}
+
+undo_markers() {
+  init_files
+
+  local removed=0 missing=0 kept=0 marker tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-ignore-undo.XXXXXX")"
+
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" ]] && continue
+    marker="${dir}/.metadata_never_index"
+
+    if [[ -e "$marker" ]]; then
+      if [[ "$MODE" == "dry-run" ]]; then
+        say "WOULD REMOVE: $marker"
+        log_msg "WOULD_REMOVE" "$marker"
+        printf '%s\n' "$dir" >> "$tmp"
+      else
+        rm -f "$marker"
+        log_msg "REMOVED" "$marker"
+        removed=$((removed + 1))
+      fi
+    elif [[ -d "$dir" ]]; then
+      log_msg "NO_MARKER" "$dir"
+      kept=$((kept + 1))
+      [[ "$MODE" == "dry-run" ]] && printf '%s\n' "$dir" >> "$tmp"
+    else
+      log_msg "MISSING" "$dir"
+      missing=$((missing + 1))
+    fi
+  done < "$STATE_FILE"
+
+  if [[ "$MODE" == "dry-run" ]]; then
+    rm -f "$tmp"
+    say "Summary: dry-run undo complete."
+  else
+    : > "$STATE_FILE"
+    rm -f "$tmp"
+    say "Summary: removed=${removed}, missing=${missing}, entries_without_marker=${kept}"
+    log_msg "SUMMARY" "mode=undo removed=${removed} missing=${missing} entries_without_marker=${kept}"
+    restart_mds_if_requested
+  fi
+}
+
+status_report() {
+  init_files
+  local entries=0 existing_dirs=0 existing_markers=0 missing_dirs=0
+
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" ]] && continue
+    entries=$((entries + 1))
+    if [[ -d "$dir" ]]; then
+      existing_dirs=$((existing_dirs + 1))
+      [[ -e "${dir}/.metadata_never_index" ]] && existing_markers=$((existing_markers + 1))
+    else
+      missing_dirs=$((missing_dirs + 1))
+    fi
+  done < "$STATE_FILE"
+
+  cat <<EOF
+State file: $STATE_FILE
+Log file:   $LOG_FILE
+
+Tracked entries:       $entries
+Existing directories:  $existing_dirs
+Existing markers:      $existing_markers
+Missing directories:   $missing_dirs
+EOF
+}
+
+clean_log() {
+  init_files
+  : > "$LOG_FILE"
+  say "Log cleared: $LOG_FILE"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        MODE="dry-run"
+        shift
+        ;;
+      --apply)
+        MODE="apply"
+        shift
+        ;;
+      --undo)
+        MODE="undo"
+        shift
+        ;;
+      --status)
+        MODE="status"
+        shift
+        ;;
+      --clean-log)
+        MODE="clean-log"
+        shift
+        ;;
+      --scan)
+        shift
+        if [[ $# -eq 0 ]]; then
+          say "Error: --scan requires a path" >&2
+          exit 2
+        fi
+        SCAN_ROOTS+=("$1")
+        shift
+        ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --no-clean-state)
+        CLEAN_STATE=0
+        shift
+        ;;
+      --restart-mds)
+        RESTART_MDS=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        say "Unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+      *)
+        SCAN_ROOTS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  if [[ ${#SCAN_ROOTS[@]} -eq 0 ]]; then
+    SCAN_ROOTS=("${DEFAULT_SCAN_ROOTS[@]}")
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  case "$MODE" in
+    dry-run|apply)
+      apply_or_dry_run
+      ;;
+    undo)
+      # Undo should actually undo by default when --undo is selected.
+      MODE="undo-apply"
+      undo_markers
+      ;;
+    status)
+      status_report
+      ;;
+    clean-log)
+      clean_log
+      ;;
+    *)
+      say "Internal error: unsupported mode $MODE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

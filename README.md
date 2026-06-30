@@ -226,8 +226,8 @@ spotlight-dev-ignore --scan ~/Documents --scan ~/Sites --scan ~/Work
 # Example Log
 
 ``` text
-2026-06-29 22:15:04 [SCAN] /Users/james/Documents
-2026-06-29 22:15:04 [MARKED] /Users/james/Documents/project/node_modules
+2026-06-29 22:15:04 [SCAN] /Users/[user name]/Documents
+2026-06-29 22:15:04 [MARKED] /Users/[user name]/Documents/project/node_modules
 2026-06-29 22:15:05 [ADOPTED] Existing marker added to state
 2026-06-29 22:15:05 [SKIP] Already managed
 2026-06-29 22:15:06 [MISSING] Deleted project removed from state
