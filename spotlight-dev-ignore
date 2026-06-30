@@ -1,0 +1,790 @@
+#!/usr/bin/env bash
+set -euo pipefail
+###############################################################################
+# spotlight-dev-ignore
+# Created by: Electric BlueFish Productions Inc. (https://electricbluefish.com)
+# Created on: 2026-06-29
+#
+# Purpose
+# -------
+# Package Spotlight development directory exclusions as a proper CLI utility.
+#
+# Key improvements in v2
+# ----------------------
+# • Dedicated config directory: ~/.config/spotlight-dev_v2/
+# • No manual setup required; state and log files are auto-created
+# • Command-based CLI: install, update, uninstall, doctor, status, scan, undo
+# • Backward-compatible legacy flags for earlier script usage
+###############################################################################
+
+VERSION="2.0.0"
+TOOL_NAME="spotlight-dev-ignore"
+SCRIPT_BASENAME="$(basename "${BASH_SOURCE[0]}")"
+INSTALL_BIN_DIR="${SPOTLIGHT_DEV_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_PATH="${INSTALL_BIN_DIR}/${TOOL_NAME}"
+CONFIG_DIR="${SPOTLIGHT_DEV_CONFIG_DIR:-${HOME}/.config/spotlight-dev_v2}"
+STATE_FILE="${CONFIG_DIR}/applied.txt"
+LOG_FILE="${CONFIG_DIR}/optimize-spotlight-dev.log"
+DEFAULT_SCAN_ROOTS=("${HOME}/Documents")
+
+IGNORE_DIR_NAMES=(
+  "node_modules"
+  "vendor"
+  ".venv"
+  "venv"
+  "env"
+  ".tox"
+  ".nox"
+  "__pycache__"
+  ".pytest_cache"
+  ".mypy_cache"
+  ".ruff_cache"
+  ".coverage"
+  "htmlcov"
+  ".next"
+  ".nuxt"
+  ".parcel-cache"
+  ".turbo"
+  ".cache"
+  "coverage"
+  "dist"
+  "build"
+  ".vite"
+  ".rollup.cache"
+  ".eslintcache"
+  ".stylelintcache"
+  ".sass-cache"
+  "bower_components"
+  ".gradle"
+)
+
+LARAVEL_RELATIVE_DIRS=(
+  "storage/framework/cache"
+  "storage/framework/sessions"
+  "storage/framework/testing"
+  "storage/framework/views"
+  "storage/logs"
+  "bootstrap/cache"
+)
+
+VERBOSE=0
+CLEAN_STATE=1
+RESTART_MDS=0
+SCAN_MODE="dry-run"
+UNDO_DRY_RUN=0
+SCAN_ROOTS=()
+
+usage() {
+  cat <<EOF
+Usage:
+  ${SCRIPT_BASENAME} <command> [options]
+  ${SCRIPT_BASENAME} [legacy options] [scan roots...]
+
+Commands:
+  scan        Discover generated directories and mark them or preview changes.
+  undo        Remove markers tracked by this utility.
+  status      Show state, log, and installation details.
+  doctor      Validate the local environment and CLI setup.
+  install     Install ${TOOL_NAME} into ${INSTALL_BIN_DIR}.
+  update      Reinstall ${TOOL_NAME} from the current script.
+  uninstall   Remove ${TOOL_NAME} from ${INSTALL_PATH}.
+  clean-log   Truncate the audit log.
+  help        Show this help.
+
+scan options:
+  --dry-run          Preview changes. Default.
+  --apply            Create .metadata_never_index markers.
+  --scan PATH        Add a scan root. Can be repeated.
+  --verbose          Print detailed actions.
+  --no-clean-state   Keep missing paths in the state file.
+  --restart-mds      Restart Spotlight daemons after apply/undo.
+
+undo options:
+  --dry-run          Preview marker removals without deleting anything.
+  --restart-mds      Restart Spotlight daemons after undo.
+
+Legacy compatibility:
+  --dry-run [roots...]    Equivalent to: scan --dry-run [roots...]
+  --apply [roots...]      Equivalent to: scan --apply [roots...]
+  --status                Equivalent to: status
+  --undo                  Equivalent to: undo
+  --clean-log             Equivalent to: clean-log
+
+Examples:
+  ${SCRIPT_BASENAME} scan --dry-run ~/Documents ~/Sites
+  ${SCRIPT_BASENAME} scan --apply --scan ~/Documents --scan ~/Work
+  ${SCRIPT_BASENAME} doctor
+  ${SCRIPT_BASENAME} install
+  ${SCRIPT_BASENAME} undo --dry-run
+
+State directory:
+  ${CONFIG_DIR}
+EOF
+}
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+say() {
+  printf '%s\n' "$*"
+}
+
+say_err() {
+  printf '%s\n' "$*" >&2
+}
+
+verbose() {
+  if [[ "$VERBOSE" -eq 1 ]]; then
+    say "$*"
+  fi
+}
+
+log_msg() {
+  local level="$1"
+  shift
+  init_files
+  printf '%s [%s] %s\n' "$(timestamp)" "$level" "$*" >> "$LOG_FILE"
+}
+
+init_files() {
+  mkdir -p "$CONFIG_DIR"
+  touch "$STATE_FILE"
+  touch "$LOG_FILE"
+}
+
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]}"
+  local dir
+
+  dir="$(cd "$(dirname "$source")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$source")"
+}
+
+SCRIPT_PATH="$(resolve_script_path || printf '%s' "${BASH_SOURCE[0]}")"
+
+canonical_file_path() {
+  local path="$1"
+  local dir
+
+  if [[ -e "$path" ]]; then
+    dir="$(cd "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$dir" "$(basename "$path")"
+  else
+    return 1
+  fi
+}
+
+canonical_path() {
+  local path="$1"
+
+  if [[ -d "$path" ]]; then
+    (cd "$path" 2>/dev/null && pwd -P) || return 1
+  else
+    return 1
+  fi
+}
+
+state_contains() {
+  local path="$1"
+  grep -Fxq -- "$path" "$STATE_FILE" 2>/dev/null
+}
+
+add_state() {
+  local path="$1"
+
+  if ! state_contains "$path"; then
+    printf '%s\n' "$path" >> "$STATE_FILE"
+  fi
+}
+
+clean_state_missing() {
+  [[ "$CLEAN_STATE" -eq 1 ]] || return 0
+  [[ -f "$STATE_FILE" ]] || return 0
+
+  local tmp missing=0 kept=0 path
+  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-v2-state.XXXXXX")"
+
+  while IFS= read -r path || [[ -n "$path" ]]; do
+    [[ -z "$path" ]] && continue
+
+    if [[ -d "$path" ]]; then
+      printf '%s\n' "$path" >> "$tmp"
+      kept=$((kept + 1))
+    else
+      log_msg "MISSING" "$path"
+      missing=$((missing + 1))
+    fi
+  done < "$STATE_FILE"
+
+  mv "$tmp" "$STATE_FILE"
+  log_msg "STATE" "cleaned state: kept=${kept}, missing=${missing}"
+}
+
+restart_mds_if_requested() {
+  [[ "$RESTART_MDS" -eq 1 ]] || return 0
+
+  log_msg "MDS" "Restarting Spotlight daemons by request"
+  say "Restarting Spotlight daemons..."
+  sudo killall mds mds_stores mdworker_shared 2>/dev/null || true
+}
+
+find_ignore_dirs() {
+  local root="$1"
+  local name_expr=()
+  local first=1
+  local name
+
+  for name in "${IGNORE_DIR_NAMES[@]}"; do
+    if [[ "$first" -eq 1 ]]; then
+      name_expr+=( -name "$name" )
+      first=0
+    else
+      name_expr+=( -o -name "$name" )
+    fi
+  done
+
+  find "$root" \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$HOME/Applications" \) -prune -o \
+    -type d \( "${name_expr[@]}" \) -print -prune 2>/dev/null
+}
+
+find_laravel_dirs() {
+  local root="$1"
+  local artisan candidate rel project_dir
+
+  find "$root" \
+    \( -path "$HOME/Library" -o -path "$HOME/.Trash" -o -path "$HOME/Applications" -o -name node_modules -o -name vendor \) -prune -o \
+    -type f -name artisan -print 2>/dev/null |
+  while IFS= read -r artisan; do
+    project_dir="$(dirname "$artisan")"
+    for rel in "${LARAVEL_RELATIVE_DIRS[@]}"; do
+      candidate="${project_dir}/${rel}"
+      [[ -d "$candidate" ]] && printf '%s\n' "$candidate"
+    done
+  done
+}
+
+discover_targets() {
+  local root canonical
+
+  for root in "${SCAN_ROOTS[@]}"; do
+    canonical="$(canonical_path "$root" || true)"
+    if [[ -z "${canonical:-}" ]]; then
+      log_msg "WARN" "scan root not found or unreadable: $root"
+      say_err "Skipping missing/unreadable root: $root"
+      continue
+    fi
+
+    log_msg "SCAN" "$canonical"
+    find_ignore_dirs "$canonical"
+    find_laravel_dirs "$canonical"
+  done | awk '!seen[$0]++'
+}
+
+mark_dir() {
+  local dir="$1"
+  local marker="${dir}/.metadata_never_index"
+
+  if [[ -e "$marker" ]]; then
+    if state_contains "$dir"; then
+      log_msg "SKIP" "Already marked and recorded: $dir"
+      verbose "SKIP already marked: $dir"
+    else
+      log_msg "ADOPTED" "Marker already existed; adding to state: $dir"
+      add_state "$dir"
+      verbose "ADOPTED existing marker: $dir"
+    fi
+    return 0
+  fi
+
+  if [[ "$SCAN_MODE" == "dry-run" ]]; then
+    log_msg "WOULD_MARK" "$dir"
+    say "WOULD MARK: $dir"
+    return 0
+  fi
+
+  touch "$marker"
+  add_state "$dir"
+  log_msg "MARKED" "$dir"
+  verbose "MARKED: $dir"
+}
+
+command_scan() {
+  init_files
+  reset_scan_options
+  parse_scan_args "$@"
+  clean_state_missing
+
+  local total=0 marked=0 already=0 would=0 adopted=0 dir marker
+
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    total=$((total + 1))
+    marker="${dir}/.metadata_never_index"
+
+    if [[ -e "$marker" ]]; then
+      if state_contains "$dir"; then
+        already=$((already + 1))
+      else
+        adopted=$((adopted + 1))
+      fi
+    else
+      if [[ "$SCAN_MODE" == "dry-run" ]]; then
+        would=$((would + 1))
+      else
+        marked=$((marked + 1))
+      fi
+    fi
+
+    mark_dir "$dir"
+  done < <(discover_targets)
+
+  if [[ "$SCAN_MODE" == "dry-run" ]]; then
+    say "Summary: scanned_targets=${total}, would_mark=${would}, already_marked=${already}, adopted_existing=${adopted}"
+    log_msg "SUMMARY" "command=scan mode=dry-run targets=${total} would_mark=${would} already_marked=${already} adopted_existing=${adopted}"
+  else
+    say "Summary: scanned_targets=${total}, marked=${marked}, already_marked=${already}, adopted_existing=${adopted}"
+    log_msg "SUMMARY" "command=scan mode=apply targets=${total} marked=${marked} already_marked=${already} adopted_existing=${adopted}"
+    restart_mds_if_requested
+  fi
+}
+
+command_undo() {
+  init_files
+  reset_undo_options
+  parse_undo_args "$@"
+
+  local removed=0 missing=0 kept=0 marker dir
+
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" ]] && continue
+    marker="${dir}/.metadata_never_index"
+
+    if [[ -e "$marker" ]]; then
+      if [[ "$UNDO_DRY_RUN" -eq 1 ]]; then
+        say "WOULD REMOVE: $marker"
+        log_msg "WOULD_REMOVE" "$marker"
+      else
+        rm -f "$marker"
+        log_msg "REMOVED" "$marker"
+        removed=$((removed + 1))
+      fi
+    elif [[ -d "$dir" ]]; then
+      log_msg "NO_MARKER" "$dir"
+      kept=$((kept + 1))
+    else
+      log_msg "MISSING" "$dir"
+      missing=$((missing + 1))
+    fi
+  done < "$STATE_FILE"
+
+  if [[ "$UNDO_DRY_RUN" -eq 1 ]]; then
+    say "Summary: undo dry-run complete."
+    log_msg "SUMMARY" "command=undo mode=dry-run"
+    return 0
+  fi
+
+  : > "$STATE_FILE"
+  say "Summary: removed=${removed}, missing=${missing}, entries_without_marker=${kept}"
+  log_msg "SUMMARY" "command=undo mode=apply removed=${removed} missing=${missing} entries_without_marker=${kept}"
+  restart_mds_if_requested
+}
+
+status_report() {
+  init_files
+
+  local entries=0 existing_dirs=0 existing_markers=0 missing_dirs=0 dir
+
+  while IFS= read -r dir || [[ -n "$dir" ]]; do
+    [[ -z "$dir" ]] && continue
+    entries=$((entries + 1))
+
+    if [[ -d "$dir" ]]; then
+      existing_dirs=$((existing_dirs + 1))
+      [[ -e "${dir}/.metadata_never_index" ]] && existing_markers=$((existing_markers + 1))
+    else
+      missing_dirs=$((missing_dirs + 1))
+    fi
+  done < "$STATE_FILE"
+
+  cat <<EOF
+Tool:       ${TOOL_NAME}
+Version:    ${VERSION}
+Script:     ${SCRIPT_PATH}
+Installed:  $(installed_status_line)
+
+Config dir: ${CONFIG_DIR}
+State file: ${STATE_FILE}
+Log file:   ${LOG_FILE}
+
+Tracked entries:       ${entries}
+Existing directories:  ${existing_dirs}
+Existing markers:      ${existing_markers}
+Missing directories:   ${missing_dirs}
+Default scan root:     ${DEFAULT_SCAN_ROOTS[*]}
+EOF
+}
+
+installed_status_line() {
+  if [[ -x "$INSTALL_PATH" ]]; then
+    printf '%s\n' "$INSTALL_PATH"
+  else
+    printf '%s\n' "not installed to ${INSTALL_PATH}"
+  fi
+}
+
+report_check() {
+  local level="$1"
+  local message="$2"
+  printf '[%s] %s\n' "$level" "$message"
+}
+
+command_doctor() {
+  init_files
+
+  local failures=0 warnings=0 cmd
+  local required_commands=(find awk grep mktemp touch date sed tr)
+  local optional_commands=(mdutil sudo)
+
+  say "Doctor report"
+  say "-------------"
+
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    report_check "OK" "Operating system is macOS"
+  else
+    report_check "FAIL" "Operating system is not macOS"
+    failures=$((failures + 1))
+  fi
+
+  for cmd in "${required_commands[@]}"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      report_check "OK" "Required command available: $cmd"
+    else
+      report_check "FAIL" "Required command missing: $cmd"
+      failures=$((failures + 1))
+    fi
+  done
+
+  for cmd in "${optional_commands[@]}"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      report_check "OK" "Optional command available: $cmd"
+    else
+      report_check "WARN" "Optional command unavailable: $cmd"
+      warnings=$((warnings + 1))
+    fi
+  done
+
+  if [[ -d "$CONFIG_DIR" && -w "$CONFIG_DIR" ]]; then
+    report_check "OK" "Config directory ready: $CONFIG_DIR"
+  else
+    report_check "FAIL" "Config directory is not writable: $CONFIG_DIR"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$STATE_FILE" && -w "$STATE_FILE" ]]; then
+    report_check "OK" "State file ready: $STATE_FILE"
+  else
+    report_check "FAIL" "State file is not writable: $STATE_FILE"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -f "$LOG_FILE" && -w "$LOG_FILE" ]]; then
+    report_check "OK" "Log file ready: $LOG_FILE"
+  else
+    report_check "FAIL" "Log file is not writable: $LOG_FILE"
+    failures=$((failures + 1))
+  fi
+
+  if [[ -d "${DEFAULT_SCAN_ROOTS[0]}" ]]; then
+    report_check "OK" "Default scan root exists: ${DEFAULT_SCAN_ROOTS[0]}"
+  else
+    report_check "WARN" "Default scan root does not exist: ${DEFAULT_SCAN_ROOTS[0]}"
+    warnings=$((warnings + 1))
+  fi
+
+  if [[ -x "$INSTALL_PATH" ]]; then
+    report_check "OK" "CLI installed at: $INSTALL_PATH"
+  else
+    report_check "WARN" "CLI not installed at: $INSTALL_PATH"
+    warnings=$((warnings + 1))
+  fi
+
+  if command -v mdutil >/dev/null 2>&1; then
+    local spotlight_status
+    spotlight_status="$(mdutil -s / 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+    if [[ -n "$spotlight_status" ]]; then
+      report_check "OK" "Spotlight status: $spotlight_status"
+    else
+      report_check "WARN" "Unable to read Spotlight status"
+      warnings=$((warnings + 1))
+    fi
+  fi
+
+  say
+  say "Summary: failures=${failures}, warnings=${warnings}"
+
+  if [[ "$failures" -ne 0 ]]; then
+    return 1
+  fi
+}
+
+copy_with_optional_sudo() {
+  local source="$1"
+  local destination="$2"
+  local source_canonical destination_canonical
+
+  source_canonical="$(canonical_file_path "$source" || true)"
+  destination_canonical="$(canonical_file_path "$destination" || true)"
+
+  if [[ -n "$source_canonical" && "$source_canonical" == "$destination_canonical" ]]; then
+    chmod 755 "$destination"
+    return 0
+  fi
+
+  if [[ -d "$INSTALL_BIN_DIR" && -w "$INSTALL_BIN_DIR" ]] || [[ ! -e "$INSTALL_BIN_DIR" && -w "$(dirname "$INSTALL_BIN_DIR")" ]]; then
+    mkdir -p "$INSTALL_BIN_DIR"
+    cp "$source" "$destination"
+    chmod 755 "$destination"
+    return 0
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    say_err "Install path requires elevated permissions and sudo is unavailable: $INSTALL_BIN_DIR"
+    return 1
+  fi
+
+  say "Elevated permissions are required to write to ${INSTALL_BIN_DIR}."
+  sudo mkdir -p "$INSTALL_BIN_DIR"
+  sudo cp "$source" "$destination"
+  sudo chmod 755 "$destination"
+}
+
+command_install() {
+  copy_with_optional_sudo "$SCRIPT_PATH" "$INSTALL_PATH"
+  say "Installed CLI: $INSTALL_PATH"
+}
+
+command_update() {
+  copy_with_optional_sudo "$SCRIPT_PATH" "$INSTALL_PATH"
+  say "Updated CLI: $INSTALL_PATH"
+}
+
+remove_with_optional_sudo() {
+  local target="$1"
+  local parent_dir
+
+  if [[ ! -e "$target" ]]; then
+    return 0
+  fi
+
+  parent_dir="$(dirname "$target")"
+
+  if [[ -w "$parent_dir" ]]; then
+    rm -f "$target"
+    return 0
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    say_err "Cannot remove ${target}; sudo is unavailable."
+    return 1
+  fi
+
+  say "Elevated permissions are required to remove ${target}."
+  sudo rm -f "$target"
+}
+
+command_uninstall() {
+  if [[ ! -e "$INSTALL_PATH" ]]; then
+    say "CLI is not installed at: $INSTALL_PATH"
+    return 0
+  fi
+
+  remove_with_optional_sudo "$INSTALL_PATH"
+  say "Removed CLI: $INSTALL_PATH"
+  say "State directory preserved: $CONFIG_DIR"
+}
+
+command_clean_log() {
+  init_files
+  : > "$LOG_FILE"
+  say "Log cleared: $LOG_FILE"
+}
+
+reset_scan_options() {
+  VERBOSE=0
+  CLEAN_STATE=1
+  RESTART_MDS=0
+  SCAN_MODE="dry-run"
+  SCAN_ROOTS=()
+}
+
+reset_undo_options() {
+  RESTART_MDS=0
+  UNDO_DRY_RUN=0
+}
+
+parse_scan_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        SCAN_MODE="dry-run"
+        shift
+        ;;
+      --apply)
+        SCAN_MODE="apply"
+        shift
+        ;;
+      --scan)
+        shift
+        if [[ $# -eq 0 ]]; then
+          say_err "Error: --scan requires a path"
+          exit 2
+        fi
+        SCAN_ROOTS+=("$1")
+        shift
+        ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --no-clean-state)
+        CLEAN_STATE=0
+        shift
+        ;;
+      --restart-mds)
+        RESTART_MDS=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        say_err "Unknown scan option: $1"
+        exit 2
+        ;;
+      *)
+        SCAN_ROOTS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  while [[ $# -gt 0 ]]; do
+    SCAN_ROOTS+=("$1")
+    shift
+  done
+
+  if [[ ${#SCAN_ROOTS[@]} -eq 0 ]]; then
+    SCAN_ROOTS=("${DEFAULT_SCAN_ROOTS[@]}")
+  fi
+}
+
+parse_undo_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        UNDO_DRY_RUN=1
+        shift
+        ;;
+      --restart-mds)
+        RESTART_MDS=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      -*)
+        say_err "Unknown undo option: $1"
+        exit 2
+        ;;
+      *)
+        say_err "Unexpected argument for undo: $1"
+        exit 2
+        ;;
+    esac
+  done
+}
+
+run_legacy_or_default() {
+  case "${1:-}" in
+    --dry-run|--apply|--scan|--verbose|--no-clean-state|--restart-mds)
+      command_scan "$@"
+      ;;
+    --undo)
+      shift
+      command_undo "$@"
+      ;;
+    --status)
+      shift
+      status_report "$@"
+      ;;
+    --clean-log)
+      shift
+      command_clean_log "$@"
+      ;;
+    --help|-h)
+      usage
+      ;;
+    "")
+      command_scan --dry-run
+      ;;
+    *)
+      command_scan "$@"
+      ;;
+  esac
+}
+
+main() {
+  case "${1:-}" in
+    scan)
+      shift
+      command_scan "$@"
+      ;;
+    undo)
+      shift
+      command_undo "$@"
+      ;;
+    status)
+      shift
+      status_report "$@"
+      ;;
+    doctor)
+      shift
+      command_doctor "$@"
+      ;;
+    install)
+      shift
+      command_install "$@"
+      ;;
+    update)
+      shift
+      command_update "$@"
+      ;;
+    uninstall)
+      shift
+      command_uninstall "$@"
+      ;;
+    clean-log)
+      shift
+      command_clean_log "$@"
+      ;;
+    help)
+      usage
+      ;;
+    --*|"")
+      run_legacy_or_default "$@"
+      ;;
+    *)
+      run_legacy_or_default "$@"
+      ;;
+  esac
+}
+
+main "$@"
