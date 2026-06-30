@@ -4,27 +4,6 @@
 Spotlight indexing overhead by selectively excluding dependency, cache,
 build, and generated directories while leaving source code searchable.
 
-## What changed in v2
-
-- Dedicated state directory: `~/.config/spotlight-dev_v2/`
-- No manual setup required
-- Proper command-based CLI
-- Clearer source filename: `./spotlight-dev-ignore`
-- Installable as `/usr/local/bin/spotlight-dev-ignore`
-- Backward-compatible legacy flags still work
-- First-run adoption of existing `.metadata_never_index` markers
-
-On first run, the tool automatically creates:
-
-```text
-~/.config/spotlight-dev_v2/
-├── applied.txt
-# Spotlight Dev Ignore
-
-`Spotlight Dev Ignore` is a macOS CLI utility for developers that reduces
-Spotlight indexing overhead by selectively excluding dependency, cache, build,
-and generated directories while leaving source code searchable.
-
 ## At a glance
 
 - Local source CLI: `./spotlight-dev-ignore`
@@ -82,6 +61,48 @@ It also performs a one-time adoption scan for existing
 Any matching directories are imported into `applied.txt`, deduplicated, and
 treated as managed by the tool. This makes `status`, `undo`, and future scans
 work correctly with markers created manually or by older versions.
+
+### Adopt existing markers
+
+The v2 tool automatically **adopts** existing `.metadata_never_index` markers
+the first time it runs.
+
+In practice, that means it looks for marker files in:
+
+- `~/Documents`
+- `~/Sites`
+- `~/Work`
+
+For each marker it finds, the tool records the marker's parent directory in:
+
+```text
+~/.config/spotlight-dev_v2/applied.txt
+```
+
+Then it deduplicates the state file so every tracked directory appears only
+once.
+
+This is important because it makes previously unmanaged markers behave like
+native v2 markers:
+
+- `status` reports them
+- `undo` can remove them
+- later scans recognize them as already managed
+
+Typical adoption sources include:
+
+- markers created manually
+- markers created by an older version of the script
+- markers left behind from previous experiments
+
+The one-time adoption pass is recorded by:
+
+```text
+~/.config/spotlight-dev_v2/bootstrap-v2-complete
+```
+
+At the moment, adoption is automatic on first run only. There is **not yet** a
+separate `adopt` command for manually re-running the import later.
 
 ---
 
