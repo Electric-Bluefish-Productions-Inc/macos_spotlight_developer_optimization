@@ -25,7 +25,9 @@ INSTALL_PATH="${INSTALL_BIN_DIR}/${TOOL_NAME}"
 CONFIG_DIR="${SPOTLIGHT_DEV_CONFIG_DIR:-${HOME}/.config/spotlight-dev_v2}"
 STATE_FILE="${CONFIG_DIR}/applied.txt"
 LOG_FILE="${CONFIG_DIR}/optimize-spotlight-dev.log"
+BOOTSTRAP_FILE="${CONFIG_DIR}/bootstrap-v2-complete"
 DEFAULT_SCAN_ROOTS=("${HOME}/Documents")
+BOOTSTRAP_SCAN_ROOTS=("${HOME}/Documents" "${HOME}/Sites" "${HOME}/Work")
 
 IGNORE_DIR_NAMES=(
   "node_modules"
@@ -73,6 +75,7 @@ RESTART_MDS=0
 SCAN_MODE="dry-run"
 UNDO_DRY_RUN=0
 SCAN_ROOTS=()
+INIT_FILES_DONE=0
 
 usage() {
   cat <<EOF
@@ -148,9 +151,45 @@ log_msg() {
 }
 
 init_files() {
+  [[ "$INIT_FILES_DONE" -eq 1 ]] && return 0
+
   mkdir -p "$CONFIG_DIR"
   touch "$STATE_FILE"
   touch "$LOG_FILE"
+  INIT_FILES_DONE=1
+  bootstrap_existing_markers_if_needed
+}
+
+bootstrap_existing_markers_if_needed() {
+  [[ -e "$BOOTSTRAP_FILE" ]] && return 0
+
+  local tmp found=0 root canonical marker_dir
+  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-v2-bootstrap.XXXXXX")"
+
+  for root in "${BOOTSTRAP_SCAN_ROOTS[@]}"; do
+    canonical="$(canonical_path "$root" || true)"
+    [[ -n "${canonical:-}" ]] || continue
+
+    while IFS= read -r marker_dir; do
+      [[ -n "$marker_dir" ]] || continue
+      printf '%s\n' "$marker_dir" >> "$tmp"
+      found=$((found + 1))
+    done < <(
+      find "$canonical" -type f -name '.metadata_never_index' -exec dirname {} \; 2>/dev/null |
+      while IFS= read -r marker_dir; do
+        canonical_path "$marker_dir" || true
+      done
+    )
+  done
+
+  if [[ -s "$tmp" ]]; then
+    cat "$tmp" >> "$STATE_FILE"
+    sort -u "$STATE_FILE" -o "$STATE_FILE"
+  fi
+
+  : > "$BOOTSTRAP_FILE"
+  rm -f "$tmp"
+  log_msg "BOOTSTRAP" "adopted existing markers from common roots: discovered=${found}"
 }
 
 resolve_script_path() {
@@ -444,7 +483,7 @@ command_doctor() {
   init_files
 
   local failures=0 warnings=0 cmd
-  local required_commands=(find awk grep mktemp touch date sed tr)
+  local required_commands=(find awk grep mktemp touch date sed sort tr)
   local optional_commands=(mdutil sudo)
 
   say "Doctor report"

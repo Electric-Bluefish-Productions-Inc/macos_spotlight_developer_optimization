@@ -12,16 +12,26 @@ build, and generated directories while leaving source code searchable.
 - Clearer source filename: `./spotlight-dev-ignore`
 - Installable as `/usr/local/bin/spotlight-dev-ignore`
 - Backward-compatible legacy flags still work
+- First-run adoption of existing `.metadata_never_index` markers
 
 On first run, the tool automatically creates:
 
 ```text
 ~/.config/spotlight-dev_v2/
 ├── applied.txt
-└── optimize-spotlight-dev.log
-```
+# Spotlight Dev Ignore
 
-No manual `mkdir` or `touch` steps are required.
+`Spotlight Dev Ignore` is a macOS CLI utility for developers that reduces
+Spotlight indexing overhead by selectively excluding dependency, cache, build,
+and generated directories while leaving source code searchable.
+
+## At a glance
+
+- Local source CLI: `./spotlight-dev-ignore`
+- Legacy wrapper: `./spotlight-dev-ignore.sh`
+- Installed global command: `/usr/local/bin/spotlight-dev-ignore`
+- State directory: `~/.config/spotlight-dev_v2/`
+- No manual setup required
 
 ---
 
@@ -35,6 +45,43 @@ Instead of disabling Spotlight entirely, this utility creates
 `.metadata_never_index` markers only in directories that are safe to exclude.
 
 Source code, documentation, configuration, and assets remain indexed.
+
+---
+
+## What v2 adds
+
+- Dedicated state directory: `~/.config/spotlight-dev_v2/`
+- Command-based CLI
+- Install, update, uninstall, doctor, status, scan, undo, and clean-log commands
+- Automatic creation of config, state, and log files
+- Backward-compatible support for the older flag-based wrapper
+- First-run adoption of existing `.metadata_never_index` markers
+
+---
+
+## First-run behavior
+
+On first run, the tool automatically creates:
+
+```text
+~/.config/spotlight-dev_v2/
+├── applied.txt
+├── bootstrap-v2-complete
+└── optimize-spotlight-dev.log
+```
+
+No manual `mkdir` or `touch` steps are required.
+
+It also performs a one-time adoption scan for existing
+`.metadata_never_index` files under these common development roots:
+
+- `~/Documents`
+- `~/Sites`
+- `~/Work`
+
+Any matching directories are imported into `applied.txt`, deduplicated, and
+treated as managed by the tool. This makes `status`, `undo`, and future scans
+work correctly with markers created manually or by older versions.
 
 ---
 
@@ -89,7 +136,14 @@ Source code, documentation, configuration, and assets remain indexed.
 
 ---
 
-## Commands
+## Install and usage
+
+### Run locally from the repo
+
+```bash
+./spotlight-dev-ignore doctor
+./spotlight-dev-ignore scan --dry-run ~/Documents
+```
 
 ### Install globally
 
@@ -108,6 +162,7 @@ After that you can run it from anywhere:
 ```bash
 spotlight-dev-ignore doctor
 spotlight-dev-ignore scan --dry-run ~/Documents
+spotlight-dev-ignore status
 ```
 
 ### Update the installed CLI
@@ -124,25 +179,37 @@ spotlight-dev-ignore uninstall
 
 This removes the binary but preserves your state directory.
 
-### Run diagnostics
+---
+
+## Commands
+
+### Doctor
+
+Validates the local environment and reports configuration issues.
 
 ```bash
 spotlight-dev-ignore doctor
 ```
 
-### View status
+### Status
+
+Shows current state, log, install path, and tracked directory counts.
 
 ```bash
 spotlight-dev-ignore status
 ```
 
-### Preview a scan
+### Scan preview
+
+Shows what would be marked without creating any files.
 
 ```bash
 spotlight-dev-ignore scan --dry-run ~/Documents ~/Sites
 ```
 
 ### Apply markers
+
+Creates `.metadata_never_index` markers in matched directories.
 
 ```bash
 spotlight-dev-ignore scan --apply ~/Documents ~/Sites ~/Work
@@ -163,6 +230,8 @@ spotlight-dev-ignore undo --restart-mds
 
 ### Undo managed markers
 
+Removes only markers tracked in `applied.txt`.
+
 ```bash
 spotlight-dev-ignore undo
 ```
@@ -181,13 +250,9 @@ spotlight-dev-ignore clean-log
 
 ---
 
-## Tested on MacOS Big Sur Version 11.7.11
-
----
-
 ## Legacy compatibility
 
-The previous flag-based workflow still works:
+The older flag-based workflow still works through `./spotlight-dev-ignore.sh`:
 
 ```bash
 ./spotlight-dev-ignore.sh --dry-run ~/Documents
@@ -196,8 +261,8 @@ The previous flag-based workflow still works:
 ./spotlight-dev-ignore.sh --undo
 ```
 
-Those commands delegate to `./spotlight-dev-ignore` and now use the
-new v2 config directory.
+Those commands delegate to `./spotlight-dev-ignore` and use the same v2 state
+directory.
 
 ---
 
@@ -206,6 +271,9 @@ new v2 config directory.
 ### `applied.txt`
 
 Tracks every directory managed by the utility.
+
+On first run, it is also backfilled from existing `.metadata_never_index`
+markers found in `~/Documents`, `~/Sites`, and `~/Work`.
 
 Used to:
 
@@ -219,12 +287,17 @@ Used to:
 Keeps a timestamped audit trail of:
 
 - scan roots
+- bootstrap adoption activity
 - directories marked
 - existing markers adopted
 - skipped directories
 - removed state entries
 - warnings
 - summary statistics
+
+### `bootstrap-v2-complete`
+
+Marks that the one-time adoption pass has already been performed.
 
 ---
 
@@ -235,6 +308,7 @@ cat ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
 tail -f ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
 tail -100 ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
 grep MARKED ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
+grep BOOTSTRAP ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
 grep WARN ~/.config/spotlight-dev_v2/optimize-spotlight-dev.log
 ```
 
@@ -250,11 +324,11 @@ wc -l ~/.config/spotlight-dev_v2/applied.txt
 ## Example log
 
 ```text
+2026-06-29 22:15:04 [BOOTSTRAP] adopted existing markers from common roots: discovered=3
 2026-06-29 22:15:04 [SCAN] /Users/[user name]/Documents
 2026-06-29 22:15:04 [MARKED] /Users/[user name]/Documents/project/node_modules
 2026-06-29 22:15:05 [ADOPTED] Marker already existed; adding to state
 2026-06-29 22:15:05 [SKIP] Already marked and recorded
-2026-06-29 22:15:06 [MISSING] /Users/[user name]/Documents/deleted-project/node_modules
 2026-06-29 22:15:07 [SUMMARY] command=scan mode=apply targets=18 marked=18 already_marked=214 adopted_existing=3
 ```
 
@@ -267,6 +341,14 @@ wc -l ~/.config/spotlight-dev_v2/applied.txt
 - Review with `scan --dry-run` before large scans.
 - Keep the log for auditing.
 - Do not place `.metadata_never_index` in source directories.
+
+---
+
+## Notes
+
+- This tool is intended for macOS.
+- The CLI has been tested in this workspace on macOS 11.7.11.
+- Source code directories are intentionally not excluded.
 
 ---
 
