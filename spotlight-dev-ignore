@@ -13,7 +13,7 @@ set -euo pipefail
 # ----------------------
 # • Dedicated config directory: ~/.config/spotlight-dev_v2/
 # • No manual setup required; state and log files are auto-created
-# • Command-based CLI: install, update, uninstall, doctor, status, scan, undo
+# • Command-based CLI: install, update, uninstall, doctor, status, scan, adopt, undo
 # • Backward-compatible legacy flags for earlier script usage
 ###############################################################################
 
@@ -73,8 +73,10 @@ VERBOSE=0
 CLEAN_STATE=1
 RESTART_MDS=0
 SCAN_MODE="dry-run"
+ADOPT_DRY_RUN=0
 UNDO_DRY_RUN=0
 SCAN_ROOTS=()
+ADOPT_ROOTS=()
 INIT_FILES_DONE=0
 
 usage() {
@@ -85,6 +87,7 @@ Usage:
 
 Commands:
   scan        Discover generated directories and mark them or preview changes.
+  adopt       Import existing .metadata_never_index markers into the state file.
   undo        Remove markers tracked by this utility.
   status      Show state, log, and installation details.
   doctor      Validate the local environment and CLI setup.
@@ -102,6 +105,11 @@ scan options:
   --no-clean-state   Keep missing paths in the state file.
   --restart-mds      Restart Spotlight daemons after apply/undo.
 
+adopt options:
+  --dry-run          Preview directories that would be imported.
+  --scan PATH        Add a root to search for existing markers.
+  --verbose          Print detailed actions.
+
 undo options:
   --dry-run          Preview marker removals without deleting anything.
   --restart-mds      Restart Spotlight daemons after undo.
@@ -116,6 +124,8 @@ Legacy compatibility:
 Examples:
   ${SCRIPT_BASENAME} scan --dry-run ~/Documents ~/Sites
   ${SCRIPT_BASENAME} scan --apply --scan ~/Documents --scan ~/Work
+  ${SCRIPT_BASENAME} adopt --dry-run
+  ${SCRIPT_BASENAME} adopt --scan ~/Projects
   ${SCRIPT_BASENAME} doctor
   ${SCRIPT_BASENAME} install
   ${SCRIPT_BASENAME} undo --dry-run
@@ -163,33 +173,79 @@ init_files() {
 bootstrap_existing_markers_if_needed() {
   [[ -e "$BOOTSTRAP_FILE" ]] && return 0
 
-  local tmp found=0 root canonical marker_dir
-  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-v2-bootstrap.XXXXXX")"
+  adopt_existing_markers_from_roots "bootstrap" 0 0 "${BOOTSTRAP_SCAN_ROOTS[@]}"
 
-  for root in "${BOOTSTRAP_SCAN_ROOTS[@]}"; do
+  : > "$BOOTSTRAP_FILE"
+}
+
+discover_existing_marker_dirs() {
+  local report_missing_roots="$1"
+  shift
+
+  local root canonical marker_dir
+
+  for root in "$@"; do
     canonical="$(canonical_path "$root" || true)"
-    [[ -n "${canonical:-}" ]] || continue
+    if [[ -z "${canonical:-}" ]]; then
+      if [[ "$report_missing_roots" -eq 1 ]]; then
+        log_msg "WARN" "adopt root not found or unreadable: $root"
+        say_err "Skipping missing/unreadable adopt root: $root"
+      fi
+      continue
+    fi
 
+    find "$canonical" -type f -name '.metadata_never_index' -exec dirname {} \; 2>/dev/null |
     while IFS= read -r marker_dir; do
-      [[ -n "$marker_dir" ]] || continue
-      printf '%s\n' "$marker_dir" >> "$tmp"
-      found=$((found + 1))
-    done < <(
-      find "$canonical" -type f -name '.metadata_never_index' -exec dirname {} \; 2>/dev/null |
-      while IFS= read -r marker_dir; do
-        canonical_path "$marker_dir" || true
-      done
-    )
-  done
+      canonical_path "$marker_dir" || true
+    done
+  done | awk '!seen[$0]++'
+}
 
-  if [[ -s "$tmp" ]]; then
+adopt_existing_markers_from_roots() {
+  local reason="$1"
+  local dry_run="$2"
+  local report_missing_roots="$3"
+  shift 3
+
+  local tmp discovered=0 added=0 already=0 dir
+  tmp="$(mktemp "${TMPDIR:-/tmp}/spotlight-dev-v2-adopt.XXXXXX")"
+
+  while IFS= read -r dir; do
+    [[ -z "$dir" ]] && continue
+    discovered=$((discovered + 1))
+
+    if state_contains "$dir"; then
+      already=$((already + 1))
+      verbose "ALREADY TRACKED: $dir"
+      continue
+    fi
+
+    added=$((added + 1))
+
+    if [[ "$dry_run" -eq 1 ]]; then
+      say "WOULD ADOPT: $dir"
+    else
+      printf '%s\n' "$dir" >> "$tmp"
+      verbose "ADOPTED: $dir"
+    fi
+  done < <(discover_existing_marker_dirs "$report_missing_roots" "$@")
+
+  if [[ "$dry_run" -eq 0 && -s "$tmp" ]]; then
     cat "$tmp" >> "$STATE_FILE"
     sort -u "$STATE_FILE" -o "$STATE_FILE"
   fi
 
-  : > "$BOOTSTRAP_FILE"
   rm -f "$tmp"
-  log_msg "BOOTSTRAP" "adopted existing markers from common roots: discovered=${found}"
+
+  if [[ "$reason" == "bootstrap" ]]; then
+    log_msg "BOOTSTRAP" "adopted existing markers from common roots: discovered=${discovered} added=${added} already_tracked=${already}"
+  elif [[ "$dry_run" -eq 1 ]]; then
+    say "Summary: discovered=${discovered}, would_add=${added}, already_tracked=${already}"
+    log_msg "SUMMARY" "command=adopt mode=dry-run discovered=${discovered} would_add=${added} already_tracked=${already}"
+  else
+    say "Summary: discovered=${discovered}, added=${added}, already_tracked=${already}"
+    log_msg "SUMMARY" "command=adopt mode=apply discovered=${discovered} added=${added} already_tracked=${already}"
+  fi
 }
 
 resolve_script_path() {
@@ -387,6 +443,14 @@ command_scan() {
     log_msg "SUMMARY" "command=scan mode=apply targets=${total} marked=${marked} already_marked=${already} adopted_existing=${adopted}"
     restart_mds_if_requested
   fi
+}
+
+command_adopt() {
+  init_files
+  reset_adopt_options
+  parse_adopt_args "$@"
+
+  adopt_existing_markers_from_roots "adopt" "$ADOPT_DRY_RUN" 1 "${ADOPT_ROOTS[@]}"
 }
 
 command_undo() {
@@ -658,6 +722,12 @@ reset_scan_options() {
   SCAN_ROOTS=()
 }
 
+reset_adopt_options() {
+  VERBOSE=0
+  ADOPT_DRY_RUN=0
+  ADOPT_ROOTS=()
+}
+
 reset_undo_options() {
   RESTART_MDS=0
   UNDO_DRY_RUN=0
@@ -751,6 +821,55 @@ parse_undo_args() {
   done
 }
 
+parse_adopt_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        ADOPT_DRY_RUN=1
+        shift
+        ;;
+      --scan)
+        shift
+        if [[ $# -eq 0 ]]; then
+          say_err "Error: --scan requires a path"
+          exit 2
+        fi
+        ADOPT_ROOTS+=("$1")
+        shift
+        ;;
+      --verbose)
+        VERBOSE=1
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        say_err "Unknown adopt option: $1"
+        exit 2
+        ;;
+      *)
+        ADOPT_ROOTS+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  while [[ $# -gt 0 ]]; do
+    ADOPT_ROOTS+=("$1")
+    shift
+  done
+
+  if [[ ${#ADOPT_ROOTS[@]} -eq 0 ]]; then
+    ADOPT_ROOTS=("${BOOTSTRAP_SCAN_ROOTS[@]}")
+  fi
+}
+
 run_legacy_or_default() {
   case "${1:-}" in
     --dry-run|--apply|--scan|--verbose|--no-clean-state|--restart-mds)
@@ -785,6 +904,10 @@ main() {
     scan)
       shift
       command_scan "$@"
+      ;;
+    adopt)
+      shift
+      command_adopt "$@"
       ;;
     undo)
       shift

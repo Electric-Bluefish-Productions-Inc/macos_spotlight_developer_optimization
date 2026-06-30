@@ -31,7 +31,7 @@ Source code, documentation, configuration, and assets remain indexed.
 
 - Dedicated state directory: `~/.config/spotlight-dev_v2/`
 - Command-based CLI
-- Install, update, uninstall, doctor, status, scan, undo, and clean-log commands
+- Install, update, uninstall, doctor, status, scan, adopt, undo, and clean-log commands
 - Automatic creation of config, state, and log files
 - Backward-compatible support for the older flag-based wrapper
 - First-run adoption of existing `.metadata_never_index` markers
@@ -101,8 +101,8 @@ The one-time adoption pass is recorded by:
 ~/.config/spotlight-dev_v2/bootstrap-v2-complete
 ```
 
-At the moment, adoption is automatic on first run only. There is **not yet** a
-separate `adopt` command for manually re-running the import later.
+If you add markers manually later, or want to re-import unmanaged markers after
+the first run, you can use the `adopt` command.
 
 ---
 
@@ -220,6 +220,33 @@ Shows current state, log, install path, and tracked directory counts.
 spotlight-dev-ignore status
 ```
 
+### Adopt existing markers
+
+Imports existing `.metadata_never_index` markers into `applied.txt` without
+creating new marker files.
+
+With no arguments, it searches the same default roots used by the bootstrap:
+
+```bash
+spotlight-dev-ignore adopt
+```
+
+Preview what would be adopted:
+
+```bash
+spotlight-dev-ignore adopt --dry-run
+```
+
+Search custom roots:
+
+```bash
+spotlight-dev-ignore adopt --scan ~/Projects --scan ~/Archive
+spotlight-dev-ignore adopt ~/Projects ~/Archive
+```
+
+Use this when directories were marked manually, by an older version of the
+script, or outside the original first-run bootstrap.
+
 ### Scan preview
 
 Shows what would be marked without creating any files.
@@ -296,6 +323,12 @@ Tracks every directory managed by the utility.
 On first run, it is also backfilled from existing `.metadata_never_index`
 markers found in `~/Documents`, `~/Sites`, and `~/Work`.
 
+You can re-import additional unmanaged markers later with:
+
+```bash
+spotlight-dev-ignore adopt
+```
+
 Used to:
 
 - avoid duplicate work
@@ -346,6 +379,7 @@ wc -l ~/.config/spotlight-dev_v2/applied.txt
 
 ```text
 2026-06-29 22:15:04 [BOOTSTRAP] adopted existing markers from common roots: discovered=3
+2026-06-29 22:20:11 [SUMMARY] command=adopt mode=apply discovered=2 added=2 already_tracked=0
 2026-06-29 22:15:04 [SCAN] /Users/[user name]/Documents
 2026-06-29 22:15:04 [MARKED] /Users/[user name]/Documents/project/node_modules
 2026-06-29 22:15:05 [ADOPTED] Marker already existed; adding to state
