@@ -1,0 +1,9 @@
+{
+  "name": "electricbluefish/spotlight-dev-ignore",
+  "description": "macOS CLI utility for excluding developer dependency and cache directories from Spotlight indexing",
+  "type": "project",
+  "license": "MIT",
+  "bin": [
+    "spotlight-dev-ignore"
+  ]
+}
