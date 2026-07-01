@@ -119,6 +119,8 @@ the first run, you can use the `adopt` command.
 
 ### General
 
+- `.git`
+- `.idea`
 - `node_modules`
 - `vendor`
 - `.venv`, `venv`, `env`

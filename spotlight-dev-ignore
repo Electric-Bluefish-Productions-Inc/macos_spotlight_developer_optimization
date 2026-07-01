@@ -30,6 +30,8 @@ DEFAULT_SCAN_ROOTS=("${HOME}/Documents")
 BOOTSTRAP_SCAN_ROOTS=("${HOME}/Documents" "${HOME}/Sites" "${HOME}/Work")
 
 IGNORE_DIR_NAMES=(
+  ".git"
+  ".idea"
   "node_modules"
   "vendor"
   ".venv"
